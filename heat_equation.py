@@ -54,7 +54,26 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 from matplotlib.lines import Line2D
 
-plt.rcParams["font.family"] = ["Noto Sans", "DejaVu Sans"]
+def _pick_font_family():
+    """Выбирает первый доступный в системе шрифт из списка предпочтений,
+    чтобы matplotlib не выдавал предупреждение ``findfont: Font family
+    'Noto Sans' not found``."""
+    from matplotlib import font_manager
+
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    preferred = [
+        "Noto Sans",            # если установлен — используем его
+        "Liberation Sans",
+        "FreeSans",
+        "DejaVu Sans",          # шрифт по умолчанию в matplotlib
+    ]
+    for name in preferred:
+        if name in available:
+            return name
+    return "sans-serif"         # системный sans-serif как последний резерв
+
+
+plt.rcParams["font.family"] = _pick_font_family()
 plt.rcParams["axes.unicode_minus"] = False
 
 A = 1.0          # коэффициент теплопроводности a (уравнение u_t = a^2 u_xx)
