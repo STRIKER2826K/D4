@@ -295,7 +295,65 @@ def green_phi(x, t, a=A):
     return erfc_int(xv / (2.0 * a * np.sqrt(t)))
 
 
-def boundary_kernel(x, tau_nodes, dt, a=A):
+class PhiTable:
+    """Таблица накопленных масс Phi(x,t) = erfc(x/(2a√t)) для быстрой сборки
+    граничного ядра задачи Б.
+
+    Прямой расчёт boundary_kernel требует вычисления erfc_int (гауссова
+    квадратура на 80 узлов) в каждой точке (x_j, возраст) — это O(nx * nt^2)
+    тяжёлых evaluations и занимало десятки секунд. Здесь таблица строится
+    ОДИН раз на мелкой равномерной сетке моментов времени (шаг dT), а массы
+    слоёв затем выбираются из неё векторными операциями за микросекунды.
+    Внутри ячейки таблицы Phi линейно интерполируется по t; поскольку слои
+    вкладов берутся вида Phi(s_c) - Phi(s_{c+1}) с ОБЩИМ соседним узлом
+    s_{c+1} (или линейным узлом между ними), аддитивность сумм масс
+    sum_m K[j,m] = Phi(x_j, t) сохраняется тождественно (телескопическая
+    сумма)."""
+
+    def __init__(self, xs, tmax, nsub=1500, a=A):
+        self.a = a
+        self.T = np.linspace(0.0, tmax, nsub + 1)
+        self.dT = self.T[1] - self.T[0]
+        tt = np.maximum(self.T, 1e-300)
+        self.Phi = np.empty((len(xs), nsub + 2))
+        for i, xv in enumerate(xs):
+            self.Phi[i, :nsub + 1] = erfc_int(xv / (2.0 * a * np.sqrt(tt)))
+        # за правым краем таблицы Phi насыщается (ошибкой пренебрегаем:
+        # запрашиваемые возраста s всегда <= tmax)
+        self.Phi[:, nsub + 1] = self.Phi[:, nsub]
+
+    def cumulative(self, ages):
+        """Phi(x_j, s) для массива возрастов произвольной формы (результат —
+        массив (nx, ...)) с линейной интерполяцией по таблице."""
+        last = len(self.T) - 1
+        pos = np.clip(ages, 0.0, self.T[last])
+        lo = np.clip((pos / self.dT).astype(int), 0, last)      # floor
+        hi = np.minimum(lo + 1, last)
+        w = (pos - lo * self.dT) / self.dT                      # доля ячейки
+        return self.Phi[:, lo] + w * (self.Phi[:, hi] - self.Phi[:, lo])
+
+    def layer_masses(self, ages):
+        """Массив форм (nx, M): массы ядра g(x,·) на слоях [s_{c+1}, s_c] для
+        убывающего ряда возрастов ages[c] = t - tau_c (шаг dtau):
+
+            K[j,c] = Phi(x_j, ages[c]) - Phi(x_j, ages[c+1]),   c < M-1
+            K[j,M-1] = Phi(x_j, ages[M-1]).
+
+        Значения Phi берутся из таблицы с линейной интерполяцией в точках
+        самих возрастов; при ages[c+1] = ages[c] - dtau соседние слои имеют
+        ОБЩИЙ узел ages[c+1], поэтому суммы телескопируются:
+        sum_c K[j,c] = Phi(x_j, t) (консервативность сохраняется)."""
+        M = len(ages)
+        cur = self.cumulative(ages)                    # (nx, M)
+        nxt = self.cumulative(ages[1:]) if M > 1 else None
+        out = np.empty_like(cur)
+        if M > 1:
+            out[:, :-1] = cur[:, :-1] - nxt
+        out[:, -1] = cur[:, -1]                        # последний слой: Phi(возраст)
+        return out
+
+
+def boundary_kernel(x, tau_nodes, dt, a=A, table=None):
     """Дискретное граничное ядро задачи Б для сетки tau_m со шагом dt:
 
         K[j,m] = Phi(x_j, t - tau_m) - Phi(x_j, t - tau_{m+1}),   m < M-1
@@ -306,42 +364,54 @@ def boundary_kernel(x, tau_nodes, dt, a=A):
     тождественно, поэтому при постоянном mu=v=M численное решение совпадает с
     M*erfc(x/(2a√t)) с точностью до округления; при t->0 внутри полупрямой
     u -> 0 (физика медленного проникновения тепла). При x=0 все массы слоя
-    концентрируются на последнем узле (tau -> t): u(0,t)=mu(t)v(t) точно."""
+    концентрируются на последнем узле (tau -> t): u(0,t)=mu(t)v(t) точно.
+
+    Если передана готовая таблица `table` (PhiTable), массы берутся из неё —
+    это основной быстрый путь в solve_halfline; без таблицы ядро считается
+    напрямую через green_phi (точный эталон, медленно)."""
     tau_nodes = np.asarray(tau_nodes, dtype=float)
     xv = np.atleast_1d(np.asarray(x, dtype=float))
     M = len(tau_nodes)
     out = np.zeros((len(xv), M))
     t_last = tau_nodes[-1]                                  # узел tau_M-1 == t
-    for j, xx in enumerate(xv):
-        if xx <= 0.0:
-            out[j, M - 1] = 1.0            # дельта-последовательность на границе
-            continue
-        s = np.maximum(t_last - tau_nodes, 0.0)   # возраст ядра (в узле tau=t он = 0)
-        phi = green_phi(xx, np.maximum(s, 1e-300), a=a)
-        mass = np.empty(M)
-        mass[:-1] = phi[:-1] - phi[1:]
-        mass[-1] = phi[-1]
-        out[j, :] = mass
+    s = np.maximum(t_last - tau_nodes, 0.0)                 # возраст ядра
+    pos = xv > 0.0
+    if not np.any(pos):
+        out[:, M - 1] = 1.0                                 # дельта на границе
+        return out
+    if table is not None:
+        out[pos.nonzero()[0]] = table.layer_masses(s)
+    else:
+        for j in np.nonzero(pos)[0]:
+            phi = green_phi(xv[j], np.maximum(s, 1e-300), a=a)
+            mass = np.empty(M)
+            mass[:-1] = phi[:-1] - phi[1:]
+            mass[-1] = phi[-1]
+            out[j, :] = mass
+    out[~pos, M - 1] = 1.0            # дельта-последовательность на границе x=0
     return out
 
 
-def solve_halfline(mu_vals, v_vals, x, times, a=A, ns=400):
+def solve_halfline(mu_vals, v_vals, x, times, a=A, ns=400, nsub=1500):
     """Задача Б: u(x,t) = int_0^t g(x, t-tau) * mu(tau) * v(tau) dtau.
 
     mu_vals, v_vals — значения функций на сетке times. Интегрирование по tau
-    выполняется методом трапеций; ядро g берётся из boundary_kernel.
+    выполняется «точной квадратурой первого рода» (см. boundary_kernel); ядро
+    собирается из предварительной таблицы PhiTable — за счёт этого полный
+    расчёт всех срезов занимает доли секунды вместо минут.
     Возвращает массив срезов u(x,t) для каждого t из times."""
     boundary = np.asarray(mu_vals) * np.asarray(v_vals)
-    dt = times[1] - times[0]
     snaps = np.empty((len(times), len(x)))
     snaps[0] = 0.0
     i0 = int(np.where(x > 0.0)[0][0])       # первый узел x>0 (узел x=0 — особый)
+    tmax = float(times[-1])
+    table = PhiTable(x[i0:], tmax, nsub=nsub, a=a)
     for it in range(1, len(times)):
         t = times[it]
         tau = times[:it + 1]                # узлы tau_m = m*dt, m=0..it
-        K = boundary_kernel(x[i0:], tau, dt, a=a)      # (nx-i0, it+1) — массы слоёв
-        # u(x_j,t) = sum_m K[j,m] * (mu·v)(tau_m): взвешенная сумма значений
-        # границы по слоям «истории» (точная квадратура первого рода).
+        # (nx-i0, it+1) — массы слоёв «истории», выбранные из таблицы
+        K = table.layer_masses(t - tau)
+        # u(x_j,t) = sum_m K[j,m] * (mu·v)(tau_m)
         snaps[it, i0:] = K @ boundary[:it + 1]
     # граничное условие u(0,t) = mu(t)*v(t) выполняется точно (дельта-ядро при x=0):
     if i0 > 0:
